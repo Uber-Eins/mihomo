@@ -1,0 +1,23 @@
+#!/bin/sh
+
+PACKAGE_ROOT=${IPKG_INSTROOT:-}
+CONFIG_DIR="$PACKAGE_ROOT/etc/mihomo"
+CONFIG_FILE="$CONFIG_DIR/config.yaml"
+CONFIG_EXAMPLE="$PACKAGE_ROOT/usr/share/mihomo/config.yaml.example"
+
+mkdir -p "$CONFIG_DIR"
+if [ ! -e "$CONFIG_FILE" ]; then
+	cp "$CONFIG_EXAMPLE" "$CONFIG_FILE"
+	chmod 0600 "$CONFIG_FILE"
+fi
+
+[ -n "$PACKAGE_ROOT" ] && exit 0
+
+/etc/init.d/mihomo enable
+if /usr/bin/mihomo -t -d "$CONFIG_DIR" >/dev/null 2>&1; then
+	/etc/init.d/mihomo restart
+else
+	echo "mihomo: configuration test failed; service was enabled but not started" >&2
+fi
+
+exit 0

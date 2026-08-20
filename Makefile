@@ -1,6 +1,8 @@
 NAME=mihomo
 BINDIR=bin
 BRANCH=$(shell git branch --show-current)
+
+.PHONY: openwrt-arm64-apk openwrt-arm64-ipk
 ifeq ($(BRANCH),Alpha)
 VERSION=alpha-smart-$(shell git rev-parse --short HEAD)
 else ifeq ($(BRANCH),Beta)
@@ -60,6 +62,12 @@ WINDOWS_ARCH_LIST = \
 all:linux-amd64-v3 linux-arm64\
 	darwin-amd64-v3 darwin-arm64\
  	windows-amd64-v3 windows-arm64\
+
+openwrt-arm64-ipk:
+	./scripts/build-openwrt-ipk.sh
+
+openwrt-arm64-apk:
+	./scripts/build-openwrt-apk.sh
 
 
 darwin-all: darwin-amd64-v3 darwin-arm64
@@ -203,4 +211,3 @@ clean:
 
 CLANG ?= clang-14
 CFLAGS := -O2 -g -Wall -Werror $(CFLAGS)
-

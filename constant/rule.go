@@ -34,6 +34,7 @@ const (
 	RematchName
 	RuleSet
 	Network
+	Protocol
 	Uid
 	SubRules
 	MATCH
@@ -124,6 +125,8 @@ func (rt RuleType) String() string {
 		return "RuleSet"
 	case Network:
 		return "Network"
+	case Protocol:
+		return "Protocol"
 	case DSCP:
 		return "DSCP"
 	case Uid:

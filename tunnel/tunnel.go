@@ -67,6 +67,7 @@ var (
 
 	snifferDispatcher *sniffer.Dispatcher
 	sniffingEnable    = false
+	protocolSniffer   = atomic.NewTypedValue[*sniffer.ProtocolDispatcher](nil)
 
 	ruleUpdateCallback = utils.NewCallback[P.RuleProvider]()
 
@@ -74,6 +75,12 @@ var (
 )
 
 type tunnel struct{}
+
+func init() {
+	ruleUpdateCallback.Register(func(P.RuleProvider) {
+		RefreshProtocolDetection()
+	})
+}
 
 var Tunnel = tunnel{}
 var _ C.Tunnel = Tunnel
@@ -211,7 +218,47 @@ func UpdateRules(newRules []C.Rule, newSubRule map[string][]C.Rule, rp map[strin
 	rules = newRules
 	ruleProviders = rp
 	subRules = newSubRule
+	refreshProtocolDetectionLocked()
 	configMux.Unlock()
+}
+
+// RefreshProtocolDetection rebuilds the immutable detector set after a rule
+// provider has loaded or updated its classical rules.
+func RefreshProtocolDetection() {
+	configMux.Lock()
+	refreshProtocolDetectionLocked()
+	configMux.Unlock()
+}
+
+func refreshProtocolDetectionLocked() {
+	required := make(map[C.SniffProtocol]struct{})
+	collect := func(rule C.Rule) {
+		if requirement, ok := rule.(C.ProtocolRequirement); ok {
+			for _, protocol := range requirement.RequiredProtocols() {
+				required[protocol] = struct{}{}
+			}
+		}
+	}
+	for _, rule := range rules {
+		collect(rule)
+	}
+	for _, currentSubRules := range subRules {
+		for _, rule := range currentSubRules {
+			collect(rule)
+		}
+	}
+
+	protocols := make([]C.SniffProtocol, 0, len(required))
+	for _, protocol := range C.SniffProtocols {
+		if _, ok := required[protocol]; ok {
+			protocols = append(protocols, protocol)
+		}
+	}
+	if len(protocols) == 0 {
+		protocolSniffer.Store(nil)
+		return
+	}
+	protocolSniffer.Store(sniffer.NewProtocolDispatcher(protocols))
 }
 
 // Proxies return all proxies
@@ -442,6 +489,9 @@ func handleUDPConn(packet C.PacketAdapter) {
 
 	key := packet.Key()
 	sender, loaded := natTable.GetOrCreate(key, func() C.PacketSender {
+		if dispatcher := protocolSniffer.Load(); dispatcher != nil {
+			dispatcher.UDPSniff(packet.Data(), metadata)
+		}
 		sender := newPacketSender()
 		if sniffingEnable && snifferDispatcher.Enable() {
 			return snifferDispatcher.UDPSniff(packet, sender)
@@ -530,6 +580,9 @@ func handleTCPConn(connCtx C.ConnContext) {
 
 	conn := connCtx.Conn()
 	conn.ResetPeeked() // reset before sniffer
+	if dispatcher := protocolSniffer.Load(); dispatcher != nil {
+		dispatcher.TCPSniff(conn, metadata)
+	}
 	if sniffingEnable && snifferDispatcher.Enable() {
 		// Try to sniff a domain when `preHandleMetadata` failed, this is usually
 		// caused by a "Fake DNS record missing" error when enhanced-mode is fake-ip.

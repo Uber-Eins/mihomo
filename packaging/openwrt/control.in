@@ -1,0 +1,10 @@
+Package: mihomo
+Version: @VERSION@
+Section: net
+Priority: optional
+Architecture: @ARCHITECTURE@
+Installed-Size: @INSTALLED_SIZE@
+Maintainer: MetaCubeX
+License: GPL-3.0-or-later
+Homepage: https://wiki.metacubex.one/
+Description: Mihomo proxy platform with an OpenWrt procd service.
