@@ -24,3 +24,4 @@ VOLUME ["/root/.config/mihomo/"]
 COPY --from=builder /mihomo-config/ /root/.config/mihomo/
 COPY --from=builder /mihomo/mihomo /mihomo
 ENTRYPOINT [ "/mihomo" ]
+
