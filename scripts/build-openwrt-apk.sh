@@ -80,11 +80,10 @@ PACKAGE="$OUTPUT_DIR/mihomo-${PACKAGE_VERSION}.apk"
 install -d -m 0755 \
 	"$DATA_DIR/usr/bin" \
 	"$DATA_DIR/usr/share/mihomo" \
-	"$DATA_DIR/etc/init.d" \
 	"$DATA_DIR/lib/apk/packages"
 
 install -m 0755 "$BINARY" "$DATA_DIR/usr/bin/mihomo"
-install -m 0755 "$PACKAGE_FILES_DIR/mihomo.init" "$DATA_DIR/etc/init.d/mihomo"
+install -m 0755 "$PACKAGE_FILES_DIR/mihomo.init" "$DATA_DIR/usr/share/mihomo/mihomo.init"
 install -m 0644 "$PROJECT_DIR/.github/release/config.yaml" "$DATA_DIR/usr/share/mihomo/config.yaml.example"
 
 (
@@ -98,7 +97,7 @@ package_with_apk() {
 		--info "name:mihomo" \
 		--info "version:$PACKAGE_VERSION" \
 		--info "tags:openwrt:section=net" \
-		--info "description:Mihomo proxy platform with an OpenWrt procd service" \
+		--info "description:Mihomo proxy platform with an optional OpenWrt procd init script" \
 		--info "arch:$PACKAGE_ARCH" \
 		--info "license:GPL-3.0-or-later" \
 		--info "origin:mihomo" \
@@ -107,7 +106,6 @@ package_with_apk() {
 		--info "depends:procd" \
 		--script "post-install:$PACKAGE_FILES_DIR/postinst" \
 		--script "post-upgrade:$PACKAGE_FILES_DIR/postinst" \
-		--script "pre-deinstall:$PACKAGE_FILES_DIR/prerm" \
 		--files "$DATA_DIR" \
 		--output "$APK_WORK_DIR/mihomo.apk"
 }
@@ -147,7 +145,7 @@ else
 				--info "name:mihomo" \
 				--info "version:$PACKAGE_VERSION" \
 				--info "tags:openwrt:section=net" \
-				--info "description:Mihomo proxy platform with an OpenWrt procd service" \
+				--info "description:Mihomo proxy platform with an optional OpenWrt procd init script" \
 				--info "arch:$PACKAGE_ARCH" \
 				--info "license:GPL-3.0-or-later" \
 				--info "origin:mihomo" \
@@ -156,7 +154,6 @@ else
 				--info "depends:procd" \
 				--script "post-install:/package-files/postinst" \
 				--script "post-upgrade:/package-files/postinst" \
-				--script "pre-deinstall:/package-files/prerm" \
 				--files /tmp/data \
 				--output /work/mihomo.apk
 		'

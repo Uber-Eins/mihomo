@@ -48,14 +48,12 @@ CONTROL_DIR="$IPK_WORK_DIR/control"
 install -d -m 0755 \
 	"$DATA_DIR/usr/bin" \
 	"$DATA_DIR/usr/share/mihomo" \
-	"$DATA_DIR/etc/init.d" \
 	"$CONTROL_DIR"
 
 install -m 0755 "$BINARY" "$DATA_DIR/usr/bin/mihomo"
-install -m 0755 "$PACKAGE_FILES_DIR/mihomo.init" "$DATA_DIR/etc/init.d/mihomo"
+install -m 0755 "$PACKAGE_FILES_DIR/mihomo.init" "$DATA_DIR/usr/share/mihomo/mihomo.init"
 install -m 0644 "$PROJECT_DIR/.github/release/config.yaml" "$DATA_DIR/usr/share/mihomo/config.yaml.example"
 install -m 0755 "$PACKAGE_FILES_DIR/postinst" "$CONTROL_DIR/postinst"
-install -m 0755 "$PACKAGE_FILES_DIR/prerm" "$CONTROL_DIR/prerm"
 
 (
 	cd "$DATA_DIR"

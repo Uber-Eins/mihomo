@@ -11,13 +11,4 @@ if [ ! -e "$CONFIG_FILE" ]; then
 	chmod 0600 "$CONFIG_FILE"
 fi
 
-[ -n "$PACKAGE_ROOT" ] && exit 0
-
-/etc/init.d/mihomo enable
-if /usr/bin/mihomo -t -d "$CONFIG_DIR" >/dev/null 2>&1; then
-	/etc/init.d/mihomo restart
-else
-	echo "mihomo: configuration test failed; service was enabled but not started" >&2
-fi
-
 exit 0
