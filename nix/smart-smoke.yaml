@@ -1,0 +1,17 @@
+# No remote providers, geodata rules, model downloads, or listeners are needed.
+mode: rule
+log-level: warning
+geo-auto-update: false
+lgbm-auto-update: false
+profile:
+  store-selected: false
+proxy-groups:
+  - name: smart-source-check
+    type: smart
+    proxies:
+      - DIRECT
+    uselightgbm: false
+    collectdata: false
+    prefer-asn: false
+rules:
+  - MATCH,smart-source-check

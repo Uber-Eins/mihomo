@@ -44,6 +44,9 @@ Documentation can be found in [mihomo Docs](https://wiki.metacubex.one/).
 
 ## For development
 
+For reproducible source builds and NixOS integration of this fork, see
+[Building with Nix](docs/nix.md).
+
 Requirements:
 [Go 1.20 or newer](https://go.dev/dl/)
 
