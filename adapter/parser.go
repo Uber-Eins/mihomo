@@ -63,7 +63,11 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
 		}
 		proxy, err = outbound.NewVmess(*vmessOption)
 	case "vless":
-		vlessOption := &outbound.VlessOption{BasicOption: basicOption}
+		vlessOption := &outbound.VlessOption{
+			BasicOption: basicOption,
+			// Keep the default when the option is omitted.
+			RealityOpts: outbound.RealityOptions{SupportX25519MLKEM768: true},
+		}
 		err = decoder.Decode(mapping, vlessOption)
 		if err != nil {
 			break
