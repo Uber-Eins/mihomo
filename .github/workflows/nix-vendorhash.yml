@@ -1,0 +1,50 @@
+name: Nix vendorHash
+
+on:
+  push:
+    branches:
+      - Alpha
+    paths:
+      - "go.mod"
+      - "go.sum"
+      - "flake.lock"
+      - "flake.nix"
+      - "nix/package.nix"
+      - "scripts/update-nix-vendorhash.sh"
+      - ".github/workflows/nix-vendorhash.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: nix-vendorhash-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  update-vendorhash:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.ref_name }}
+
+      - uses: cachix/install-nix-action@v31
+
+      - name: Refresh vendorHash
+        run: sh scripts/update-nix-vendorhash.sh
+
+      - name: Commit updated vendorHash
+        run: |
+          if git diff --quiet -- nix/package.nix; then
+            echo "vendorHash is already up to date"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+          git add nix/package.nix
+          git commit -m "nix: update vendorHash"
+          git push origin "HEAD:${GITHUB_REF_NAME}"

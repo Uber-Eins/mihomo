@@ -81,11 +81,27 @@ nix flake update nixpkgs
 nix flake check
 ```
 
-When upstream changes `go.mod` or `go.sum`, update `vendorHash` in
-`nix/package.nix`. Temporarily set it to `lib.fakeHash`, run a build, and replace
-it with the actual `got: sha256-…` reported by the fixed-output derivation.
-Then run the real build and checks again. The expected hash-discovery failure
-is not a successful package build.
+Dependency and toolchain updates are automatic. When `go.mod`, `go.sum`,
+`flake.lock`, `flake.nix`, or the packaging files change on `Alpha`, the
+`Nix vendorHash` workflow runs `scripts/update-nix-vendorhash.sh`, which
+discovers the module fixed-output hash and writes it to `nix/package.nix`. The
+script only fetches the pinned `.#packages.<system>.default.goModules`; it does
+not compile the binary or run tests. If the hash changed, the workflow commits
+only `nix/package.nix` as a bot commit and pushes it to the triggering branch
+without force. The workflow can also be started manually on any branch. Branch
+settings must allow `github-actions[bot]` to push there; a protected branch
+that rejects the push fails the workflow.
+
+To refresh the hash locally, install Nix with flakes enabled and run:
+
+```sh
+sh scripts/update-nix-vendorhash.sh
+```
+
+The script first builds with `lib.fakeHash` to read the `got: sha256-…` value,
+then verifies the real hash. On failure or interruption it restores the exact
+previous `nix/package.nix`. This local packaging path is independent of the
+OpenWrt build.
 
 Do not set `vendorHash = null`, enable arbitrary network fetching during the
 compile phase, or bypass `go.sum` verification to make a build pass.

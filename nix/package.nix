@@ -10,7 +10,8 @@ buildGoModule {
   inherit version;
   src = lib.cleanSource ../.;
 
-  # Update this hash when go.mod/go.sum change; never replace with vendorHash=null.
+  # Maintained by scripts/update-nix-vendorhash.sh (run by CI on dependency changes);
+  # never replace with vendorHash=null.
   vendorHash = "sha256-njcAhz2DY5pwfL4NyxwXyLyhZ9SGSXuk18ojrZg0SSA=";
   subPackages = [ "." ];
 
