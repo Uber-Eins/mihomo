@@ -5,6 +5,7 @@ on:
     branches:
       - Alpha
     paths:
+      - "**/*.go"
       - "go.mod"
       - "go.sum"
       - "flake.lock"
@@ -23,6 +24,7 @@ permissions:
 
 jobs:
   update-vendorhash:
+    if: github.ref_type == 'branch'
     runs-on: ubuntu-latest
     permissions:
       contents: write

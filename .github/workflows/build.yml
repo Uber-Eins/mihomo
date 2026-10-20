@@ -1,4 +1,4 @@
-name: Build
+name: OpenWrt 25.12 APK
 on:
   workflow_dispatch:
     inputs:

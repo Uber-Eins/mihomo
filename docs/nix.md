@@ -81,10 +81,12 @@ nix flake update nixpkgs
 nix flake check
 ```
 
-Dependency and toolchain updates are automatic. When `go.mod`, `go.sum`,
-`flake.lock`, `flake.nix`, or the packaging files change on `Alpha`, the
+The dependency hash is maintained automatically. When Go source, `go.mod`,
+`go.sum`, `flake.lock`, `flake.nix`, or the packaging files change on `Alpha`, the
 `Nix vendorHash` workflow runs `scripts/update-nix-vendorhash.sh`, which
 discovers the module fixed-output hash and writes it to `nix/package.nix`. The
+workflow watches Go files because import changes can change which
+packages `go mod vendor` copies, even without a `go.mod` change. The
 script only fetches the pinned `.#packages.<system>.default.goModules`; it does
 not compile the binary or run tests. If the hash changed, the workflow commits
 only `nix/package.nix` as a bot commit and pushes it to the triggering branch
