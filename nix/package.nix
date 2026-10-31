@@ -12,7 +12,7 @@ buildGoModule {
 
   # Maintained by scripts/update-nix-vendorhash.sh (run by CI on Go/Nix changes);
   # never replace with vendorHash=null.
-  vendorHash = "sha256-FQ02hty2kpiqnxG+LLqtYLmgO9C+ZZK6JWNmYW5h/W8=";
+  vendorHash = "sha256-XTL/gKKOfsAnMkOU/Uc5Zk3Txvt8uZZlv1S7fPZpF+c=";
   subPackages = [ "." ];
 
   env = {
