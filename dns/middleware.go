@@ -1,6 +1,7 @@
 package dns
 
 import (
+	"net"
 	"net/netip"
 	"strings"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"github.com/metacubex/mihomo/log"
 
 	D "github.com/miekg/dns"
+	"golang.org/x/exp/slices"
 )
 
 type (
@@ -177,7 +179,19 @@ func withFakeIP(skipper *fakeip.Skipper, fakePool *fakeip.Pool, fakePool6 *fakei
 					AAAA: ip.AsSlice(),
 				}
 			case D.TypeSVCB, D.TypeHTTPS:
-				return handleMsgWithEmptyAnswer(r), nil
+				msg, err := next(ctx, r)
+				if err != nil {
+					return msg, err
+				}
+
+				rewritten := msg.Copy()
+				if rewriteFakeIPServiceBindings(rewritten, skipper, fakePool, fakePool6) {
+					rewritten.AuthenticatedData = false
+					setMsgTTL(rewritten, uint32(fakeIPTTL))
+					ctx.SetType(icontext.DNSTypeFakeIP)
+					return rewritten, nil
+				}
+				return msg, nil
 			default:
 				return next(ctx, r)
 			}
@@ -194,6 +208,127 @@ func withFakeIP(skipper *fakeip.Skipper, fakePool *fakeip.Pool, fakePool6 *fakei
 			return msg, nil
 		}
 	}
+}
+
+func rewriteFakeIPServiceBindings(msg *D.Msg, skipper *fakeip.Skipper, fakePool, fakePool6 *fakeip.Pool) bool {
+	type rrsetKey struct {
+		name    string
+		rrtype  uint16
+		rrclass uint16
+	}
+	keyOf := func(hdr *D.RR_Header, rrtype uint16) rrsetKey {
+		return rrsetKey{D.CanonicalName(hdr.Name), rrtype, hdr.Class}
+	}
+	// "." targets refer to the name the client looked up, before any CNAME in this answer.
+	cnameFrom := make(map[string]string)
+	for _, rr := range msg.Answer {
+		if cname, ok := rr.(*D.CNAME); ok {
+			cnameFrom[D.CanonicalName(cname.Target)] = cname.Hdr.Name
+		}
+	}
+	queriedName := func(name string) string {
+		for range cnameFrom { // bounded, so CNAME loops terminate
+			prev, ok := cnameFrom[D.CanonicalName(name)]
+			if !ok {
+				break
+			}
+			name = prev
+		}
+		return name
+	}
+
+	rewritten := make(map[rrsetKey]struct{})
+	for _, rr := range msg.Answer {
+		var binding *D.SVCB
+		switch rr := rr.(type) {
+		case *D.HTTPS:
+			binding = &rr.SVCB
+		case *D.SVCB:
+			binding = rr
+		default:
+			continue
+		}
+		if rewriteFakeIPServiceBinding(binding, queriedName(binding.Hdr.Name), skipper, fakePool, fakePool6) {
+			rewritten[keyOf(&binding.Hdr, binding.Hdr.Rrtype)] = struct{}{}
+		}
+	}
+
+	msg.Extra = slices.DeleteFunc(msg.Extra, func(rr D.RR) bool {
+		hdr := rr.Header()
+		switch hdr.Rrtype {
+		case D.TypeA, D.TypeAAAA:
+			rewritten[keyOf(hdr, hdr.Rrtype)] = struct{}{}
+			return true
+		default:
+			return false
+		}
+	})
+	if len(rewritten) == 0 {
+		return false
+	}
+
+	removeSignature := func(rr D.RR) bool {
+		sig, ok := rr.(*D.RRSIG)
+		if !ok {
+			return false
+		}
+		_, ok = rewritten[keyOf(&sig.Hdr, sig.TypeCovered)]
+		return ok
+	}
+	msg.Answer = slices.DeleteFunc(msg.Answer, removeSignature)
+	msg.Extra = slices.DeleteFunc(msg.Extra, removeSignature)
+	return true
+}
+
+// rewriteFakeIPServiceBinding points the IP hints of a ServiceMode record at
+// the fake IPs of its endpoint, so they match the A/AAAA answers for that name.
+// owner is the record owner with CNAMEs unwound; it is used for "." targets.
+func rewriteFakeIPServiceBinding(rr *D.SVCB, owner string, skipper *fakeip.Skipper, fakePool, fakePool6 *fakeip.Pool) bool {
+	if rr.Priority == 0 {
+		return false
+	}
+	endpoint := owner
+	if rr.Target != "." {
+		endpoint = rr.Target
+	}
+	endpoint = trimAttrleaf(strings.TrimRight(endpoint, "."))
+	if skipper.ShouldSkipped(endpoint) {
+		return false
+	}
+
+	var changed, removedIPv4Hint, removedIPv6Hint bool
+	rr.Value = slices.DeleteFunc(rr.Value, func(param D.SVCBKeyValue) bool {
+		switch hint := param.(type) {
+		case *D.SVCBIPv4Hint:
+			changed = true
+			if fakePool == nil {
+				removedIPv4Hint = true
+				return true
+			}
+			hint.Hint = []net.IP{fakePool.Lookup(endpoint).AsSlice()}
+		case *D.SVCBIPv6Hint:
+			changed = true
+			if fakePool6 == nil {
+				removedIPv6Hint = true
+				return true
+			}
+			hint.Hint = []net.IP{fakePool6.Lookup(endpoint).AsSlice()}
+		}
+		return false
+	})
+	if removedIPv4Hint || removedIPv6Hint {
+		rr.Value = slices.DeleteFunc(rr.Value, func(param D.SVCBKeyValue) bool {
+			mandatory, ok := param.(*D.SVCBMandatory)
+			if !ok {
+				return false
+			}
+			mandatory.Code = slices.DeleteFunc(mandatory.Code, func(key D.SVCBKey) bool {
+				return key == D.SVCB_IPV4HINT && removedIPv4Hint || key == D.SVCB_IPV6HINT && removedIPv6Hint
+			})
+			return len(mandatory.Code) == 0
+		})
+	}
+	return changed
 }
 
 func withResolver(resolver resolver.Resolver, ipv6 bool) handler {
@@ -246,4 +381,16 @@ func newHandler(resolver resolver.Resolver, mapper *ResolverEnhancer) handler {
 	}
 
 	return compose(middlewares, withResolver(resolver, mapper.ipv6))
+}
+
+// trimAttrleaf strips underscore labels such as "_8443._https." (RFC 9460 port prefix naming).
+func trimAttrleaf(name string) string {
+	for strings.HasPrefix(name, "_") {
+		i := strings.IndexByte(name, '.')
+		if i < 0 {
+			break
+		}
+		name = name[i+1:]
+	}
+	return name
 }
