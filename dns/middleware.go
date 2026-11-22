@@ -1,6 +1,7 @@
 package dns
 
 import (
+	"math"
 	"net"
 	"net/netip"
 	"strings"
@@ -179,17 +180,29 @@ func withFakeIP(skipper *fakeip.Skipper, fakePool *fakeip.Pool, fakePool6 *fakei
 					AAAA: ip.AsSlice(),
 				}
 			case D.TypeSVCB, D.TypeHTTPS:
-				msg, err := next(ctx, r)
-				if err != nil {
-					return msg, err
+				svcHost := trimAttrleaf(host)
+				if skipper.ShouldSkipped(svcHost) {
+					return next(ctx, r)
 				}
 
-				rewritten := msg.Copy()
-				if rewriteFakeIPServiceBindings(rewritten, skipper, fakePool, fakePool6) {
-					rewritten.AuthenticatedData = false
-					setMsgTTL(rewritten, uint32(fakeIPTTL))
-					ctx.SetType(icontext.DNSTypeFakeIP)
-					return rewritten, nil
+				msg := handleMsgWithEmptyAnswer(r)
+				upstream, err := next(ctx, r)
+				ctx.SetType(icontext.DNSTypeFakeIP)
+				if err != nil {
+					log.Debugln("[DNS] fake-ip %s exchange failed, answering NODATA: %v", q.String(), err)
+					return msg, nil
+				}
+				if upstream.Rcode != D.RcodeSuccess {
+					return msg, nil
+				}
+
+				answer, ttl := fakeIPServiceBindings(upstream, q, svcHost, fakePool, fakePool6)
+				if ttl > uint32(fakeIPTTL) {
+					ttl = uint32(fakeIPTTL)
+				}
+				if answer != nil {
+					msg.Answer = answer
+					setMsgTTL(msg, ttl)
 				}
 				return msg, nil
 			default:
@@ -210,35 +223,46 @@ func withFakeIP(skipper *fakeip.Skipper, fakePool *fakeip.Pool, fakePool6 *fakei
 	}
 }
 
-func rewriteFakeIPServiceBindings(msg *D.Msg, skipper *fakeip.Skipper, fakePool, fakePool6 *fakeip.Pool) bool {
-	type rrsetKey struct {
-		name    string
-		rrtype  uint16
-		rrclass uint16
-	}
-	keyOf := func(hdr *D.RR_Header, rrtype uint16) rrsetKey {
-		return rrsetKey{D.CanonicalName(hdr.Name), rrtype, hdr.Class}
-	}
-	// "." targets refer to the name the client looked up, before any CNAME in this answer.
-	cnameFrom := make(map[string]string)
-	for _, rr := range msg.Answer {
-		if cname, ok := rr.(*D.CNAME); ok {
-			cnameFrom[D.CanonicalName(cname.Target)] = cname.Hdr.Name
+// fakeIPServiceBindings rebuilds the HTTPS/SVCB answer of a fake-ip query so it
+// agrees with the fake A/AAAA answers: the CNAME chain is collapsed onto the
+// query name, TargetName becomes "." and IP hints point at the fake IPs of host.
+// Records that would make the client resolve another name are not kept, and an
+// RRset containing AliasMode is dropped entirely (RFC 9460 section 2.4.1).
+// It returns nil when nothing is usable, and the lowest TTL of the records used.
+func fakeIPServiceBindings(upstream *D.Msg, q D.Question, host string, fakePool, fakePool6 *fakeip.Pool) ([]D.RR, uint32) {
+	ttl := uint32(math.MaxUint32)
+	useTTL := func(hdr *D.RR_Header) {
+		if hdr.Ttl < ttl {
+			ttl = hdr.Ttl
 		}
-	}
-	queriedName := func(name string) string {
-		for range cnameFrom { // bounded, so CNAME loops terminate
-			prev, ok := cnameFrom[D.CanonicalName(name)]
-			if !ok {
-				break
-			}
-			name = prev
-		}
-		return name
 	}
 
-	rewritten := make(map[rrsetKey]struct{})
-	for _, rr := range msg.Answer {
+	cnames := make(map[string]*D.CNAME)
+	for _, rr := range upstream.Answer {
+		if cname, ok := rr.(*D.CNAME); ok {
+			cnames[D.CanonicalName(cname.Hdr.Name)] = cname
+		}
+	}
+	name := D.CanonicalName(q.Name)
+	for range cnames { // bounded, so CNAME loops terminate
+		cname, ok := cnames[name]
+		if !ok {
+			break
+		}
+		useTTL(&cname.Hdr)
+		name = D.CanonicalName(cname.Target)
+	}
+	if _, ok := cnames[name]; ok {
+		return nil, 0
+	}
+
+	var answer []D.RR
+	for _, rr := range upstream.Answer {
+		hdr := rr.Header()
+		if hdr.Rrtype != q.Qtype || D.CanonicalName(hdr.Name) != name {
+			continue
+		}
+		rr = D.Copy(rr)
 		var binding *D.SVCB
 		switch rr := rr.(type) {
 		case *D.HTTPS:
@@ -248,71 +272,42 @@ func rewriteFakeIPServiceBindings(msg *D.Msg, skipper *fakeip.Skipper, fakePool,
 		default:
 			continue
 		}
-		if rewriteFakeIPServiceBinding(binding, queriedName(binding.Hdr.Name), skipper, fakePool, fakePool6) {
-			rewritten[keyOf(&binding.Hdr, binding.Hdr.Rrtype)] = struct{}{}
+		if binding.Priority == 0 {
+			return nil, 0
 		}
-	}
-
-	msg.Extra = slices.DeleteFunc(msg.Extra, func(rr D.RR) bool {
-		hdr := rr.Header()
-		switch hdr.Rrtype {
-		case D.TypeA, D.TypeAAAA:
-			rewritten[keyOf(hdr, hdr.Rrtype)] = struct{}{}
-			return true
-		default:
-			return false
+		if binding.Target != "." && D.CanonicalName(binding.Target) != name {
+			continue
 		}
-	})
-	if len(rewritten) == 0 {
-		return false
+		useTTL(&binding.Hdr)
+		binding.Hdr.Name = q.Name
+		binding.Target = "."
+		rewriteFakeIPHints(binding, host, fakePool, fakePool6)
+		answer = append(answer, rr)
 	}
-
-	removeSignature := func(rr D.RR) bool {
-		sig, ok := rr.(*D.RRSIG)
-		if !ok {
-			return false
-		}
-		_, ok = rewritten[keyOf(&sig.Hdr, sig.TypeCovered)]
-		return ok
+	if len(answer) == 0 {
+		return nil, 0
 	}
-	msg.Answer = slices.DeleteFunc(msg.Answer, removeSignature)
-	msg.Extra = slices.DeleteFunc(msg.Extra, removeSignature)
-	return true
+	return answer, ttl
 }
 
-// rewriteFakeIPServiceBinding points the IP hints of a ServiceMode record at
-// the fake IPs of its endpoint, so they match the A/AAAA answers for that name.
-// owner is the record owner with CNAMEs unwound; it is used for "." targets.
-func rewriteFakeIPServiceBinding(rr *D.SVCB, owner string, skipper *fakeip.Skipper, fakePool, fakePool6 *fakeip.Pool) bool {
-	if rr.Priority == 0 {
-		return false
-	}
-	endpoint := owner
-	if rr.Target != "." {
-		endpoint = rr.Target
-	}
-	endpoint = trimAttrleaf(strings.TrimRight(endpoint, "."))
-	if skipper.ShouldSkipped(endpoint) {
-		return false
-	}
-
-	var changed, removedIPv4Hint, removedIPv6Hint bool
+// rewriteFakeIPHints points ipv4hint/ipv6hint at the fake IPs of host. Hints of
+// a family without a fake-ip pool are removed, together with their mandatory keys.
+func rewriteFakeIPHints(rr *D.SVCB, host string, fakePool, fakePool6 *fakeip.Pool) {
+	var removedIPv4Hint, removedIPv6Hint bool
 	rr.Value = slices.DeleteFunc(rr.Value, func(param D.SVCBKeyValue) bool {
 		switch hint := param.(type) {
 		case *D.SVCBIPv4Hint:
-			changed = true
 			if fakePool == nil {
 				removedIPv4Hint = true
 				return true
 			}
-			hint.Hint = []net.IP{fakePool.Lookup(endpoint).AsSlice()}
+			hint.Hint = []net.IP{fakePool.Lookup(host).AsSlice()}
 		case *D.SVCBIPv6Hint:
-			changed = true
 			if fakePool6 == nil {
 				removedIPv6Hint = true
 				return true
 			}
-			hint.Hint = []net.IP{fakePool6.Lookup(endpoint).AsSlice()}
+			hint.Hint = []net.IP{fakePool6.Lookup(host).AsSlice()}
 		}
 		return false
 	})
@@ -328,7 +323,6 @@ func rewriteFakeIPServiceBinding(rr *D.SVCB, owner string, skipper *fakeip.Skipp
 			return len(mandatory.Code) == 0
 		})
 	}
-	return changed
 }
 
 func withResolver(resolver resolver.Resolver, ipv6 bool) handler {

@@ -18,83 +18,140 @@ import (
 
 const fakeIPTestTTL = 120
 
-func TestWithFakeIPHTTPSRewritesOwnerHint(t *testing.T) {
-	const host = "example.com."
-	answer := fakeIPTestRR(t, `example.com. 60 IN HTTPS 1 . alpn="h3,h2" no-default-alpn port=443 ipv4hint=203.0.113.10,203.0.113.11 ech="AAQAAQID" key65400="\000\255"`).(*D.HTTPS)
-	upstream := fakeIPTestResponse(host, D.TypeHTTPS, answer)
+func TestWithFakeIPHTTPSRewritesHints(t *testing.T) {
+	answer := fakeIPTestRR(t, `example.com. 60 IN HTTPS 1 . alpn="h3,h2" no-default-alpn port=443 ipv4hint=203.0.113.10,203.0.113.11 ech="AAQAAQID" ipv6hint=2001:db8::1 key65400="\000\255"`).(*D.HTTPS)
+	upstream := fakeIPTestResponse("example.com.", D.TypeHTTPS, answer)
+	upstream.AuthenticatedData = true
 	before, err := upstream.Pack()
 	require.NoError(t, err)
-	h := fakeIPTestHandler(&fakeip.Skipper{}, fakeIPTestPool(t, "198.18.0.0/24"), nil, upstream)
+	h := fakeIPTestHandler(nil, fakeIPTestPool(t, "198.18.0.0/24"), fakeIPTestPool(t, "fd00::/120"), fakeIPTestTTL, upstream)
 
-	got, responseType := fakeIPTestExchange(t, h, host, D.TypeHTTPS)
-	a, _ := fakeIPTestExchange(t, h, host, D.TypeA)
+	got, responseType := fakeIPTestExchange(t, h, "example.com.", D.TypeHTTPS)
+	a, _ := fakeIPTestExchange(t, h, "example.com.", D.TypeA)
+	aaaa, _ := fakeIPTestExchange(t, h, "example.com.", D.TypeAAAA)
 	require.Equal(t, icontext.DNSTypeFakeIP, responseType)
-	require.NotSame(t, upstream, got)
+	require.False(t, got.AuthenticatedData)
 	require.Len(t, got.Answer, 1)
-	rewritten := got.Answer[0].(*D.HTTPS)
-	require.Equal(t, uint32(fakeIPTestTTL), rewritten.Hdr.Ttl)
-	wantParams := append([]D.SVCBKeyValue(nil), answer.Value...)
-	wantParams[3] = &D.SVCBIPv4Hint{Hint: []net.IP{a.Answer[0].(*D.A).A}}
-	require.Equal(t, wantParams, rewritten.Value)
+	https := got.Answer[0].(*D.HTTPS)
+	require.Equal(t, uint32(60), https.Hdr.Ttl, "upstream TTL is lower than fake-ip-ttl")
+	want := append([]D.SVCBKeyValue(nil), answer.Value...)
+	want[3] = &D.SVCBIPv4Hint{Hint: []net.IP{a.Answer[0].(*D.A).A}}
+	want[5] = &D.SVCBIPv6Hint{Hint: []net.IP{aaaa.Answer[0].(*D.AAAA).AAAA}}
+	require.Equal(t, want, https.Value)
+
 	after, err := upstream.Pack()
 	require.NoError(t, err)
 	require.Equal(t, before, after, "upstream response must not be mutated")
 }
 
-func TestWithFakeIPSVCBRewritesTargetHints(t *testing.T) {
-	const host, target = "example.com.", "endpoint.example.net."
-	answer := fakeIPTestRR(t, `example.com. 60 IN SVCB 1 endpoint.example.net. ipv4hint=203.0.113.10 ipv6hint=2001:db8::1`)
-	pool := fakeIPTestPool(t, "198.18.0.0/24")
-	pool6 := fakeIPTestPool(t, "fd00::/120")
-	h := fakeIPTestHandler(&fakeip.Skipper{}, pool, pool6, fakeIPTestResponse(host, D.TypeSVCB, answer))
-
-	got, _ := fakeIPTestExchange(t, h, host, D.TypeSVCB)
-	a, _ := fakeIPTestExchange(t, h, target, D.TypeA)
-	aaaa, _ := fakeIPTestExchange(t, h, target, D.TypeAAAA)
-	params := got.Answer[0].(*D.SVCB).Value
-	require.Equal(t, a.Answer[0].(*D.A).A, params[0].(*D.SVCBIPv4Hint).Hint[0])
-	require.Equal(t, aaaa.Answer[0].(*D.AAAA).AAAA, params[1].(*D.SVCBIPv6Hint).Hint[0])
-	require.NotEqual(t, net.IP(pool.Lookup("example.com").AsSlice()), params[0].(*D.SVCBIPv4Hint).Hint[0])
+func TestWithFakeIPHTTPSTTLCappedByFakeIPTTL(t *testing.T) {
+	upstream := fakeIPTestResponse("example.com.", D.TypeHTTPS, fakeIPTestRR(t, `example.com. 3600 IN HTTPS 1 . alpn=h2`))
+	h := fakeIPTestHandler(nil, fakeIPTestPool(t, "198.18.0.0/24"), nil, 5, upstream)
+	got, _ := fakeIPTestExchange(t, h, "example.com.", D.TypeHTTPS)
+	require.Equal(t, uint32(5), got.Answer[0].Header().Ttl)
 }
 
-func TestWithFakeIPHTTPSOwnerHintFollowsQueriedName(t *testing.T) {
+func TestWithFakeIPHTTPSCollapsesCNAME(t *testing.T) {
 	pool := fakeIPTestPool(t, "198.18.0.0/24")
+	for _, target := range []string{".", "edge.cdn.example.net."} {
+		t.Run(target, func(t *testing.T) {
+			upstream := fakeIPTestResponse("www.example.com.", D.TypeHTTPS,
+				fakeIPTestRR(t, `www.example.com. 30 IN CNAME edge.cdn.example.net.`),
+				fakeIPTestRR(t, `edge.cdn.example.net. 300 IN HTTPS 1 `+target+` ipv4hint=203.0.113.10 ech="AAQAAQID"`),
+			)
+			h := fakeIPTestHandler(nil, pool, nil, fakeIPTestTTL, upstream)
+			got, _ := fakeIPTestExchange(t, h, "www.example.com.", D.TypeHTTPS)
+			a, _ := fakeIPTestExchange(t, h, "www.example.com.", D.TypeA)
+			require.Len(t, got.Answer, 1)
+			https := got.Answer[0].(*D.HTTPS)
+			require.Equal(t, "www.example.com.", https.Hdr.Name)
+			require.Equal(t, ".", https.Target)
+			require.Equal(t, uint32(30), https.Hdr.Ttl, "TTL includes the CNAME chain")
+			require.Equal(t, []net.IP{a.Answer[0].(*D.A).A}, https.Value[0].(*D.SVCBIPv4Hint).Hint)
+			require.Equal(t, []byte{0, 4, 0, 1, 2, 3}, https.Value[1].(*D.SVCBECHConfig).ECH)
+		})
+	}
+}
+
+func TestWithFakeIPHTTPSDropsOtherTargets(t *testing.T) {
+	upstream := fakeIPTestResponse("example.com.", D.TypeHTTPS,
+		fakeIPTestRR(t, `example.com. 60 IN HTTPS 1 shared-cdn.example.net. ipv4hint=203.0.113.10`),
+		fakeIPTestRR(t, `example.com. 60 IN HTTPS 2 . alpn=h2`),
+	)
+	h := fakeIPTestHandler(nil, fakeIPTestPool(t, "198.18.0.0/24"), nil, fakeIPTestTTL, upstream)
+	got, _ := fakeIPTestExchange(t, h, "example.com.", D.TypeHTTPS)
+	require.Len(t, got.Answer, 1)
+	require.Equal(t, uint16(2), got.Answer[0].(*D.HTTPS).Priority)
+}
+
+func TestWithFakeIPHTTPSAnswersNODATA(t *testing.T) {
 	for _, tc := range []struct {
-		name, query, want string
-		answers           []string
+		name    string
+		answers []string
 	}{
-		{"cname", "www.example.com.", "www.example.com.", []string{
-			`www.example.com. 60 IN CNAME edge.cdn.example.net.`,
-			`edge.cdn.example.net. 60 IN HTTPS 1 . ipv4hint=203.0.113.10`,
+		{"alias mode drops whole rrset", []string{
+			`example.com. 60 IN HTTPS 0 svc.example.net.`,
+			`example.com. 60 IN HTTPS 1 . ipv4hint=203.0.113.10`,
 		}},
-		{"port prefix", "_8443._https.example.com.", "example.com.", []string{
-			`_8443._https.example.com. 60 IN HTTPS 1 . port=8443 ipv4hint=203.0.113.10`,
+		{"only other targets", []string{
+			`example.com. 60 IN HTTPS 1 shared-cdn.example.net. ipv4hint=203.0.113.10`,
 		}},
+		{"cname without https", []string{
+			`example.com. 60 IN CNAME edge.example.net.`,
+		}},
+		{"cname loop", []string{
+			`example.com. 60 IN CNAME a.example.net.`,
+			`a.example.net. 60 IN CNAME example.com.`,
+			`example.com. 60 IN HTTPS 1 . alpn=h2`,
+		}},
+		{"no answer", nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var answers []D.RR
 			for _, rr := range tc.answers {
 				answers = append(answers, fakeIPTestRR(t, rr))
 			}
-			h := fakeIPTestHandler(&fakeip.Skipper{}, pool, nil, fakeIPTestResponse(tc.query, D.TypeHTTPS, answers...))
-			got, _ := fakeIPTestExchange(t, h, tc.query, D.TypeHTTPS)
-			a, _ := fakeIPTestExchange(t, h, tc.want, D.TypeA)
-			https := got.Answer[len(got.Answer)-1].(*D.HTTPS)
-			require.Equal(t, []net.IP{a.Answer[0].(*D.A).A}, https.Value[len(https.Value)-1].(*D.SVCBIPv4Hint).Hint)
+			upstream := fakeIPTestResponse("example.com.", D.TypeHTTPS, answers...)
+			upstream.Ns = []D.RR{fakeIPTestRR(t, `example.net. 60 IN SOA ns.example.net. host.example.net. 1 7200 3600 1209600 60`)}
+			h := fakeIPTestHandler(nil, fakeIPTestPool(t, "198.18.0.0/24"), nil, fakeIPTestTTL, upstream)
+			got, responseType := fakeIPTestExchange(t, h, "example.com.", D.TypeHTTPS)
+			fakeIPTestRequireNODATA(t, got)
+			require.Equal(t, icontext.DNSTypeFakeIP, responseType)
+		})
+	}
+}
+
+func TestWithFakeIPHTTPSUpstreamFailureAnswersNODATA(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		rcode int
+		err   error
+	}{
+		{"error", D.RcodeSuccess, errors.New("upstream failed")},
+		{"servfail", D.RcodeServerFailure, nil},
+		{"nxdomain", D.RcodeNameError, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream := fakeIPTestResponse("example.com.", D.TypeHTTPS, fakeIPTestRR(t, `example.com. 60 IN HTTPS 1 . alpn=h2`))
+			upstream.Rcode = tc.rcode
+			h := withFakeIP(&fakeip.Skipper{}, fakeIPTestPool(t, "198.18.0.0/24"), nil, fakeIPTestTTL)(func(_ *icontext.DNSContext, _ *D.Msg) (*D.Msg, error) {
+				return upstream, tc.err
+			})
+			got, err := h(icontext.NewDNSContext(context.Background()), new(D.Msg).SetQuestion("example.com.", D.TypeHTTPS))
+			require.NoError(t, err)
+			fakeIPTestRequireNODATA(t, got)
 		})
 	}
 }
 
 func TestWithFakeIPHTTPSRemovesUnavailableHintsFromMandatory(t *testing.T) {
-	const host = "example.com."
-	upstream := fakeIPTestResponse(host, D.TypeHTTPS,
+	upstream := fakeIPTestResponse("example.com.", D.TypeHTTPS,
 		fakeIPTestRR(t, `example.com. 60 IN HTTPS 1 . mandatory=ipv6hint,alpn alpn=h2 ipv6hint=2001:db8::1`),
 		fakeIPTestRR(t, `example.com. 60 IN HTTPS 2 . mandatory=ipv6hint ipv6hint=2001:db8::2`),
 	)
-	h := fakeIPTestHandler(&fakeip.Skipper{}, fakeIPTestPool(t, "198.18.0.0/24"), nil, upstream)
+	h := fakeIPTestHandler(nil, fakeIPTestPool(t, "198.18.0.0/24"), nil, fakeIPTestTTL, upstream)
 
-	got, responseType := fakeIPTestExchange(t, h, host, D.TypeHTTPS)
-	require.Equal(t, icontext.DNSTypeFakeIP, responseType)
+	got, _ := fakeIPTestExchange(t, h, "example.com.", D.TypeHTTPS)
 	require.Equal(t, []D.SVCBKeyValue{
 		&D.SVCBMandatory{Code: []D.SVCBKey{D.SVCB_ALPN}},
 		&D.SVCBAlpn{Alpn: []string{"h2"}},
@@ -103,79 +160,61 @@ func TestWithFakeIPHTTPSRemovesUnavailableHintsFromMandatory(t *testing.T) {
 	require.Equal(t, []D.SVCBKey{D.SVCB_IPV6HINT, D.SVCB_ALPN}, upstream.Answer[0].(*D.HTTPS).Value[0].(*D.SVCBMandatory).Code)
 }
 
-func TestWithFakeIPHTTPSRemovesGlueAndInvalidatedSignatures(t *testing.T) {
-	const host = "example.com."
-	alias := fakeIPTestRR(t, `example.com. 60 IN HTTPS 0 svc.example.net.`).(*D.HTTPS)
-	service := fakeIPTestRR(t, `svc.example.net. 60 IN HTTPS 1 . ipv4hint=203.0.113.10`)
-	sig := func(name string, covered uint16) *D.RRSIG {
-		return &D.RRSIG{Hdr: D.RR_Header{Name: name, Rrtype: D.TypeRRSIG, Class: D.ClassINET, Ttl: 60}, TypeCovered: covered}
-	}
-	upstream := fakeIPTestResponse(host, D.TypeHTTPS, alias, service, sig(host, D.TypeHTTPS), sig("SVC.example.net.", D.TypeHTTPS))
+func TestWithFakeIPHTTPSSynthesizesCleanResponse(t *testing.T) {
+	upstream := fakeIPTestResponse("example.com.", D.TypeHTTPS,
+		fakeIPTestRR(t, `example.com. 60 IN HTTPS 1 . ipv4hint=203.0.113.10`),
+		&D.RRSIG{Hdr: D.RR_Header{Name: "example.com.", Rrtype: D.TypeRRSIG, Class: D.ClassINET, Ttl: 60}, TypeCovered: D.TypeHTTPS},
+	)
 	upstream.AuthenticatedData = true
-	upstream.Extra = []D.RR{
-		sig("svc.example.net.", D.TypeHTTPS),
-		fakeIPTestRR(t, `svc.example.net. 60 IN A 203.0.113.10`),
-		fakeIPTestRR(t, `svc.example.net. 60 IN AAAA 2001:db8::1`),
-		sig("svc.example.net.", D.TypeA),
-		fakeIPTestRR(t, `example.com. 60 IN TXT "keep"`),
-	}
+	upstream.Ns = []D.RR{fakeIPTestRR(t, `example.com. 60 IN NSEC next.example.com. A HTTPS RRSIG NSEC`)}
+	upstream.Extra = []D.RR{fakeIPTestRR(t, `example.com. 60 IN A 203.0.113.10`)}
 	upstream.SetEdns0(1232, true)
-	h := fakeIPTestHandler(&fakeip.Skipper{}, fakeIPTestPool(t, "198.18.0.0/24"), nil, upstream)
+	h := fakeIPTestHandler(nil, fakeIPTestPool(t, "198.18.0.0/24"), nil, fakeIPTestTTL, upstream)
 
-	got, _ := fakeIPTestExchange(t, h, host, D.TypeHTTPS)
+	got, _ := fakeIPTestExchange(t, h, "example.com.", D.TypeHTTPS)
 	require.False(t, got.AuthenticatedData)
-	require.True(t, upstream.AuthenticatedData)
-	require.Len(t, got.Answer, 3)
-	wantAlias := D.Copy(alias)
-	wantAlias.Header().Ttl = fakeIPTestTTL
-	require.Equal(t, wantAlias, got.Answer[0])
-	a, _ := fakeIPTestExchange(t, h, "svc.example.net.", D.TypeA)
-	require.Equal(t, []net.IP{a.Answer[0].(*D.A).A}, got.Answer[1].(*D.HTTPS).Value[0].(*D.SVCBIPv4Hint).Hint)
-	require.Equal(t, host, got.Answer[2].(*D.RRSIG).Hdr.Name)
-	require.Len(t, got.Extra, 2)
-	require.Equal(t, []string{"keep"}, got.Extra[0].(*D.TXT).Txt)
-	require.Equal(t, D.Copy(upstream.IsEdns0()), got.IsEdns0())
+	require.Len(t, got.Answer, 1)
+	require.IsType(t, &D.HTTPS{}, got.Answer[0])
+	require.Empty(t, got.Ns)
+	require.Empty(t, got.Extra)
 }
 
-func TestWithFakeIPHTTPSPassesThroughUnchangedResponses(t *testing.T) {
+func TestWithFakeIPHTTPSPortPrefix(t *testing.T) {
+	upstream := fakeIPTestResponse("_8443._https.example.com.", D.TypeHTTPS,
+		fakeIPTestRR(t, `_8443._https.example.com. 60 IN HTTPS 1 . port=8443 ipv4hint=203.0.113.10`),
+	)
+	h := fakeIPTestHandler(nil, fakeIPTestPool(t, "198.18.0.0/24"), nil, fakeIPTestTTL, upstream)
+	got, _ := fakeIPTestExchange(t, h, "_8443._https.example.com.", D.TypeHTTPS)
+	a, _ := fakeIPTestExchange(t, h, "example.com.", D.TypeA)
+	https := got.Answer[0].(*D.HTTPS)
+	require.Equal(t, "_8443._https.example.com.", https.Hdr.Name)
+	require.Equal(t, []net.IP{a.Answer[0].(*D.A).A}, https.Value[1].(*D.SVCBIPv4Hint).Hint)
+}
+
+func TestWithFakeIPHTTPSSkippedPassesThrough(t *testing.T) {
 	var builder trie.DomainSetBuilder
 	require.NoError(t, builder.Insert("skipped.example.net"))
 	skipper := &fakeip.Skipper{Host: []C.DomainMatcher{builder.Build()}}
-	pool := fakeIPTestPool(t, "198.18.0.0/24")
 
-	for _, tc := range []struct {
-		name, host, rr string
-	}{
-		{"skipped query", "skipped.example.net.", `skipped.example.net. 60 IN HTTPS 1 . ipv4hint=203.0.113.10`},
-		{"skipped target", "example.com.", `example.com. 60 IN HTTPS 1 skipped.example.net. ipv4hint=203.0.113.10`},
-		{"alias mode", "example.com.", `example.com. 60 IN HTTPS 0 target.example.net. ipv4hint=203.0.113.10`},
-		{"no hints", "example.com.", `example.com. 60 IN HTTPS 1 . alpn=h2 ech="AAQAAQID"`},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			upstream := fakeIPTestResponse(tc.host, D.TypeHTTPS, fakeIPTestRR(t, tc.rr))
+	for _, query := range []string{"skipped.example.net.", "_8443._https.skipped.example.net."} {
+		t.Run(query, func(t *testing.T) {
+			upstream := fakeIPTestResponse(query, D.TypeHTTPS, fakeIPTestRR(t, query+` 60 IN HTTPS 1 . ipv4hint=203.0.113.10`))
 			upstream.AuthenticatedData = true
-			if tc.name == "skipped query" {
-				upstream.Extra = []D.RR{fakeIPTestRR(t, `skipped.example.net. 60 IN A 203.0.113.10`)}
-			}
-			h := fakeIPTestHandler(skipper, pool, nil, upstream)
-			got, responseType := fakeIPTestExchange(t, h, tc.host, D.TypeHTTPS)
+			h := fakeIPTestHandler(skipper, fakeIPTestPool(t, "198.18.0.0/24"), nil, fakeIPTestTTL, upstream)
+			got, responseType := fakeIPTestExchange(t, h, query, D.TypeHTTPS)
 			require.Same(t, upstream, got)
-			require.True(t, got.AuthenticatedData)
-			require.Equal(t, uint32(60), got.Answer[0].Header().Ttl)
 			require.Equal(t, icontext.DNSTypeRaw, responseType)
 		})
 	}
 }
 
-func TestWithFakeIPHTTPSReturnsUpstreamError(t *testing.T) {
-	wantErr := errors.New("upstream failed")
-	upstream := fakeIPTestResponse("example.com.", D.TypeHTTPS)
-	h := withFakeIP(&fakeip.Skipper{}, nil, nil, fakeIPTestTTL)(func(_ *icontext.DNSContext, _ *D.Msg) (*D.Msg, error) {
-		return upstream, wantErr
-	})
-	got, err := h(icontext.NewDNSContext(context.Background()), new(D.Msg).SetQuestion("example.com.", D.TypeHTTPS))
-	require.Same(t, wantErr, err)
-	require.Same(t, upstream, got)
+func fakeIPTestRequireNODATA(t *testing.T, msg *D.Msg) {
+	t.Helper()
+	require.Equal(t, D.RcodeSuccess, msg.Rcode)
+	require.False(t, msg.AuthenticatedData)
+	require.Empty(t, msg.Answer)
+	require.Empty(t, msg.Ns)
+	require.Empty(t, msg.Extra)
 }
 
 func fakeIPTestPool(t *testing.T, prefix string) *fakeip.Pool {
@@ -198,8 +237,11 @@ func fakeIPTestResponse(host string, qtype uint16, answers ...D.RR) *D.Msg {
 	return msg
 }
 
-func fakeIPTestHandler(skipper *fakeip.Skipper, pool, pool6 *fakeip.Pool, upstream *D.Msg) handler {
-	return withFakeIP(skipper, pool, pool6, fakeIPTestTTL)(func(ctx *icontext.DNSContext, _ *D.Msg) (*D.Msg, error) {
+func fakeIPTestHandler(skipper *fakeip.Skipper, pool, pool6 *fakeip.Pool, ttl int, upstream *D.Msg) handler {
+	if skipper == nil {
+		skipper = &fakeip.Skipper{}
+	}
+	return withFakeIP(skipper, pool, pool6, ttl)(func(ctx *icontext.DNSContext, _ *D.Msg) (*D.Msg, error) {
 		ctx.SetType(icontext.DNSTypeRaw)
 		return upstream, nil
 	})
