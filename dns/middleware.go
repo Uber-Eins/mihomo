@@ -185,14 +185,21 @@ func withFakeIP(skipper *fakeip.Skipper, fakePool *fakeip.Pool, fakePool6 *fakei
 					return next(ctx, r)
 				}
 
-				msg := handleMsgWithEmptyAnswer(r)
 				upstream, err := next(ctx, r)
-				ctx.SetType(icontext.DNSTypeFakeIP)
 				if err != nil {
-					log.Debugln("[DNS] fake-ip %s exchange failed, answering NODATA: %v", q.String(), err)
-					return msg, nil
+					return upstream, err
 				}
-				if upstream.Rcode != D.RcodeSuccess {
+				ctx.SetType(icontext.DNSTypeFakeIP)
+				msg := handleMsgWithEmptyAnswer(r)
+				switch upstream.Rcode {
+				case D.RcodeSuccess:
+				case D.RcodeNameError:
+					// the fake A/AAAA answers already claim the name exists
+					return msg, nil
+				default:
+					// keep resolution failures visible so clients can refuse
+					// to downgrade from ECH (RFC 9460 section 3.1)
+					msg.Rcode = D.RcodeServerFailure
 					return msg, nil
 				}
 
@@ -278,10 +285,12 @@ func fakeIPServiceBindings(upstream *D.Msg, q D.Question, host string, fakePool,
 		if binding.Target != "." && D.CanonicalName(binding.Target) != name {
 			continue
 		}
+		if !rewriteFakeIPHints(binding, host, fakePool, fakePool6) {
+			continue
+		}
 		useTTL(&binding.Hdr)
 		binding.Hdr.Name = q.Name
 		binding.Target = "."
-		rewriteFakeIPHints(binding, host, fakePool, fakePool6)
 		answer = append(answer, rr)
 	}
 	if len(answer) == 0 {
@@ -291,38 +300,34 @@ func fakeIPServiceBindings(upstream *D.Msg, q D.Question, host string, fakePool,
 }
 
 // rewriteFakeIPHints points ipv4hint/ipv6hint at the fake IPs of host. Hints of
-// a family without a fake-ip pool are removed, together with their mandatory keys.
-func rewriteFakeIPHints(rr *D.SVCB, host string, fakePool, fakePool6 *fakeip.Pool) {
-	var removedIPv4Hint, removedIPv6Hint bool
+// a family without a fake-ip pool are removed; if such a hint is mandatory the
+// record cannot be kept as published and false is returned.
+func rewriteFakeIPHints(rr *D.SVCB, host string, fakePool, fakePool6 *fakeip.Pool) bool {
+	for _, param := range rr.Value {
+		if mandatory, ok := param.(*D.SVCBMandatory); ok {
+			for _, key := range mandatory.Code {
+				if key == D.SVCB_IPV4HINT && fakePool == nil || key == D.SVCB_IPV6HINT && fakePool6 == nil {
+					return false
+				}
+			}
+		}
+	}
 	rr.Value = slices.DeleteFunc(rr.Value, func(param D.SVCBKeyValue) bool {
 		switch hint := param.(type) {
 		case *D.SVCBIPv4Hint:
 			if fakePool == nil {
-				removedIPv4Hint = true
 				return true
 			}
 			hint.Hint = []net.IP{fakePool.Lookup(host).AsSlice()}
 		case *D.SVCBIPv6Hint:
 			if fakePool6 == nil {
-				removedIPv6Hint = true
 				return true
 			}
 			hint.Hint = []net.IP{fakePool6.Lookup(host).AsSlice()}
 		}
 		return false
 	})
-	if removedIPv4Hint || removedIPv6Hint {
-		rr.Value = slices.DeleteFunc(rr.Value, func(param D.SVCBKeyValue) bool {
-			mandatory, ok := param.(*D.SVCBMandatory)
-			if !ok {
-				return false
-			}
-			mandatory.Code = slices.DeleteFunc(mandatory.Code, func(key D.SVCBKey) bool {
-				return key == D.SVCB_IPV4HINT && removedIPv4Hint || key == D.SVCB_IPV6HINT && removedIPv6Hint
-			})
-			return len(mandatory.Code) == 0
-		})
-	}
+	return true
 }
 
 func withResolver(resolver resolver.Resolver, ipv6 bool) handler {

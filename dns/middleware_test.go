@@ -121,43 +121,58 @@ func TestWithFakeIPHTTPSAnswersNODATA(t *testing.T) {
 	}
 }
 
-func TestWithFakeIPHTTPSUpstreamFailureAnswersNODATA(t *testing.T) {
+func TestWithFakeIPHTTPSUpstreamFailures(t *testing.T) {
 	for _, tc := range []struct {
-		name  string
-		rcode int
-		err   error
+		name      string
+		rcode     int
+		wantRcode int
 	}{
-		{"error", D.RcodeSuccess, errors.New("upstream failed")},
-		{"servfail", D.RcodeServerFailure, nil},
-		{"nxdomain", D.RcodeNameError, nil},
+		{"servfail", D.RcodeServerFailure, D.RcodeServerFailure},
+		{"refused", D.RcodeRefused, D.RcodeServerFailure},
+		{"nxdomain", D.RcodeNameError, D.RcodeSuccess},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			upstream := fakeIPTestResponse("example.com.", D.TypeHTTPS, fakeIPTestRR(t, `example.com. 60 IN HTTPS 1 . alpn=h2`))
 			upstream.Rcode = tc.rcode
-			h := withFakeIP(&fakeip.Skipper{}, fakeIPTestPool(t, "198.18.0.0/24"), nil, fakeIPTestTTL)(func(_ *icontext.DNSContext, _ *D.Msg) (*D.Msg, error) {
-				return upstream, tc.err
-			})
-			got, err := h(icontext.NewDNSContext(context.Background()), new(D.Msg).SetQuestion("example.com.", D.TypeHTTPS))
-			require.NoError(t, err)
-			fakeIPTestRequireNODATA(t, got)
+			upstream.AuthenticatedData = true
+			h := fakeIPTestHandler(nil, fakeIPTestPool(t, "198.18.0.0/24"), nil, fakeIPTestTTL, upstream)
+			got, _ := fakeIPTestExchange(t, h, "example.com.", D.TypeHTTPS)
+			require.Equal(t, tc.wantRcode, got.Rcode)
+			require.False(t, got.AuthenticatedData)
+			require.Empty(t, got.Answer)
+			require.Empty(t, got.Ns)
+			require.Empty(t, got.Extra)
 		})
 	}
+
+	t.Run("exchange error", func(t *testing.T) {
+		wantErr := errors.New("upstream failed")
+		h := withFakeIP(&fakeip.Skipper{}, fakeIPTestPool(t, "198.18.0.0/24"), nil, fakeIPTestTTL)(func(_ *icontext.DNSContext, _ *D.Msg) (*D.Msg, error) {
+			return nil, wantErr
+		})
+		_, err := h(icontext.NewDNSContext(context.Background()), new(D.Msg).SetQuestion("example.com.", D.TypeHTTPS))
+		require.Same(t, wantErr, err)
+	})
 }
 
-func TestWithFakeIPHTTPSRemovesUnavailableHintsFromMandatory(t *testing.T) {
-	upstream := fakeIPTestResponse("example.com.", D.TypeHTTPS,
-		fakeIPTestRR(t, `example.com. 60 IN HTTPS 1 . mandatory=ipv6hint,alpn alpn=h2 ipv6hint=2001:db8::1`),
-		fakeIPTestRR(t, `example.com. 60 IN HTTPS 2 . mandatory=ipv6hint ipv6hint=2001:db8::2`),
-	)
-	h := fakeIPTestHandler(nil, fakeIPTestPool(t, "198.18.0.0/24"), nil, fakeIPTestTTL, upstream)
+func TestWithFakeIPHTTPSMandatoryHintWithoutPool(t *testing.T) {
+	mandatory := fakeIPTestRR(t, `example.com. 60 IN HTTPS 1 . mandatory=ipv6hint,alpn alpn=h2 ipv6hint=2001:db8::1 ech="AAQAAQID"`)
+	optional := fakeIPTestRR(t, `example.com. 60 IN HTTPS 2 . mandatory=alpn alpn=h2 ipv4hint=203.0.113.10 ipv6hint=2001:db8::2`)
+	pool := fakeIPTestPool(t, "198.18.0.0/24")
 
+	h := fakeIPTestHandler(nil, pool, nil, fakeIPTestTTL, fakeIPTestResponse("example.com.", D.TypeHTTPS, mandatory, optional))
 	got, _ := fakeIPTestExchange(t, h, "example.com.", D.TypeHTTPS)
+	a, _ := fakeIPTestExchange(t, h, "example.com.", D.TypeA)
+	require.Len(t, got.Answer, 1, "record with a mandatory ipv6hint is excluded")
 	require.Equal(t, []D.SVCBKeyValue{
 		&D.SVCBMandatory{Code: []D.SVCBKey{D.SVCB_ALPN}},
 		&D.SVCBAlpn{Alpn: []string{"h2"}},
-	}, got.Answer[0].(*D.HTTPS).Value)
-	require.Empty(t, got.Answer[1].(*D.HTTPS).Value)
-	require.Equal(t, []D.SVCBKey{D.SVCB_IPV6HINT, D.SVCB_ALPN}, upstream.Answer[0].(*D.HTTPS).Value[0].(*D.SVCBMandatory).Code)
+		&D.SVCBIPv4Hint{Hint: []net.IP{a.Answer[0].(*D.A).A}},
+	}, got.Answer[0].(*D.HTTPS).Value, "optional ipv6hint is removed, mandatory untouched")
+
+	h = fakeIPTestHandler(nil, pool, nil, fakeIPTestTTL, fakeIPTestResponse("example.com.", D.TypeHTTPS, mandatory))
+	got, _ = fakeIPTestExchange(t, h, "example.com.", D.TypeHTTPS)
+	fakeIPTestRequireNODATA(t, got)
 }
 
 func TestWithFakeIPHTTPSSynthesizesCleanResponse(t *testing.T) {
