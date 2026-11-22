@@ -298,6 +298,9 @@ dns:
   fake-ip-filter-mode: blacklist
   # 配置fakeip查询返回的TTL，非必要情况下请勿修改
   fake-ip-ttl: 1
+  # fake-ip 模式下回应 A/AAAA 前，最多等待同名 HTTPS 记录的毫秒数，默认 1000，设为 0 关闭
+  # Chromium 在拿到 A/AAAA 后只会短暂等待 HTTPS 记录，等不到就不使用 ECH
+  fake-ip-https-wait: 1000
 
   # use-hosts: true # 查询 hosts
 

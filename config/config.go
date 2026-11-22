@@ -173,6 +173,7 @@ type DNS struct {
 	FakeIPPool6           *fakeip.Pool
 	FakeIPSkipper         *fakeip.Skipper
 	FakeIPTTL             int
+	FakeIPHTTPSWait       time.Duration
 	NameServerPolicy      []dns.Policy
 	ProxyServerNameserver []dns.NameServer
 	ProxyServerPolicy     []dns.Policy
@@ -244,6 +245,7 @@ type RawDNS struct {
 	FakeIPFilter                 []string                            `yaml:"fake-ip-filter" json:"fake-ip-filter"`
 	FakeIPFilterMode             C.FilterMode                        `yaml:"fake-ip-filter-mode" json:"fake-ip-filter-mode"`
 	FakeIPTTL                    int                                 `yaml:"fake-ip-ttl" json:"fake-ip-ttl"`
+	FakeIPHTTPSWait              int                                 `yaml:"fake-ip-https-wait" json:"fake-ip-https-wait"`
 	DefaultNameserver            []string                            `yaml:"default-nameserver" json:"default-nameserver"`
 	CacheAlgorithm               string                              `yaml:"cache-algorithm" json:"cache-algorithm"`
 	CacheMaxSize                 int                                 `yaml:"cache-max-size" json:"cache-max-size"`
@@ -517,14 +519,15 @@ func DefaultRawConfig() *RawConfig {
 		GlobalUA:           "clash.meta/" + C.Version,
 		ETagSupport:        true,
 		DNS: RawDNS{
-			Enable:         false,
-			IPv6:           false,
-			UseHosts:       true,
-			UseSystemHosts: true,
-			IPv6Timeout:    100,
-			EnhancedMode:   C.DNSMapping,
-			FakeIPRange:    "198.18.0.1/16",
-			FakeIPTTL:      1,
+			Enable:          false,
+			IPv6:            false,
+			UseHosts:        true,
+			UseSystemHosts:  true,
+			IPv6Timeout:     100,
+			EnhancedMode:    C.DNSMapping,
+			FakeIPRange:     "198.18.0.1/16",
+			FakeIPTTL:       1,
+			FakeIPHTTPSWait: 1000,
 			FallbackFilter: RawFallbackFilter{
 				GeoIP:     true,
 				GeoIPCode: "CN",
@@ -1557,6 +1560,7 @@ func parseDNS(rawCfg *RawConfig, ruleProviders map[string]P.RuleProvider) (*DNS,
 
 		dnsCfg.FakeIPSkipper = skipper
 		dnsCfg.FakeIPTTL = cfg.FakeIPTTL
+		dnsCfg.FakeIPHTTPSWait = time.Duration(cfg.FakeIPHTTPSWait) * time.Millisecond // <= 0 disables
 
 		if dnsCfg.FakeIPRange.IsValid() {
 			pool, err := fakeip.New(fakeip.Options{

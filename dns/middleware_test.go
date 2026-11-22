@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/netip"
 	"testing"
+	"time"
 
 	"github.com/metacubex/mihomo/component/fakeip"
 	"github.com/metacubex/mihomo/component/trie"
@@ -147,7 +148,7 @@ func TestWithFakeIPHTTPSUpstreamFailures(t *testing.T) {
 
 	t.Run("exchange error", func(t *testing.T) {
 		wantErr := errors.New("upstream failed")
-		h := withFakeIP(&fakeip.Skipper{}, fakeIPTestPool(t, "198.18.0.0/24"), nil, fakeIPTestTTL)(func(_ *icontext.DNSContext, _ *D.Msg) (*D.Msg, error) {
+		h := withFakeIP(&fakeip.Skipper{}, fakeIPTestPool(t, "198.18.0.0/24"), nil, fakeIPTestTTL, 0)(func(_ *icontext.DNSContext, _ *D.Msg) (*D.Msg, error) {
 			return nil, wantErr
 		})
 		_, err := h(icontext.NewDNSContext(context.Background()), new(D.Msg).SetQuestion("example.com.", D.TypeHTTPS))
@@ -223,6 +224,65 @@ func TestWithFakeIPHTTPSSkippedPassesThrough(t *testing.T) {
 	}
 }
 
+func TestWithFakeIPAWaitsForHTTPS(t *testing.T) {
+	release := make(chan struct{})
+	httpsQueries := make(chan string, 1)
+	next := func(_ *icontext.DNSContext, r *D.Msg) (*D.Msg, error) {
+		if q := r.Question[0]; q.Qtype == D.TypeHTTPS {
+			httpsQueries <- q.Name
+			<-release
+		}
+		return handleMsgWithEmptyAnswer(r), nil
+	}
+
+	t.Run("until https resolves", func(t *testing.T) {
+		h := withFakeIP(&fakeip.Skipper{}, fakeIPTestPool(t, "198.18.0.0/24"), nil, fakeIPTestTTL, time.Minute)(next)
+		answered := fakeIPTestExchangeAsync(h, "example.com.", D.TypeA)
+		require.Equal(t, "example.com.", <-httpsQueries)
+		select {
+		case <-answered:
+			t.Fatal("answered before the HTTPS lookup finished")
+		case <-time.After(50 * time.Millisecond):
+		}
+		release <- struct{}{}
+		select {
+		case msg := <-answered:
+			require.Len(t, msg.Answer, 1)
+		case <-time.After(time.Second):
+			t.Fatal("not answered after the HTTPS lookup finished")
+		}
+	})
+
+	t.Run("at most the wait", func(t *testing.T) {
+		h := withFakeIP(&fakeip.Skipper{}, fakeIPTestPool(t, "198.18.0.0/24"), nil, fakeIPTestTTL, 20*time.Millisecond)(next)
+		answered := fakeIPTestExchangeAsync(h, "example.com.", D.TypeA)
+		<-httpsQueries
+		select {
+		case msg := <-answered:
+			require.Len(t, msg.Answer, 1)
+		case <-time.After(time.Second):
+			t.Fatal("wait is not bounded")
+		}
+		release <- struct{}{}
+	})
+
+	t.Run("disabled", func(t *testing.T) {
+		h := withFakeIP(&fakeip.Skipper{}, fakeIPTestPool(t, "198.18.0.0/24"), nil, fakeIPTestTTL, 0)(next)
+		msg, _ := fakeIPTestExchange(t, h, "example.com.", D.TypeA)
+		require.Len(t, msg.Answer, 1)
+		require.Empty(t, httpsQueries)
+	})
+}
+
+func fakeIPTestExchangeAsync(h handler, host string, qtype uint16) <-chan *D.Msg {
+	answered := make(chan *D.Msg, 1)
+	go func() {
+		msg, _ := h(icontext.NewDNSContext(context.Background()), new(D.Msg).SetQuestion(host, qtype))
+		answered <- msg
+	}()
+	return answered
+}
+
 func fakeIPTestRequireNODATA(t *testing.T, msg *D.Msg) {
 	t.Helper()
 	require.Equal(t, D.RcodeSuccess, msg.Rcode)
@@ -256,7 +316,7 @@ func fakeIPTestHandler(skipper *fakeip.Skipper, pool, pool6 *fakeip.Pool, ttl in
 	if skipper == nil {
 		skipper = &fakeip.Skipper{}
 	}
-	return withFakeIP(skipper, pool, pool6, ttl)(func(ctx *icontext.DNSContext, _ *D.Msg) (*D.Msg, error) {
+	return withFakeIP(skipper, pool, pool6, ttl, 0)(func(ctx *icontext.DNSContext, _ *D.Msg) (*D.Msg, error) {
 		ctx.SetType(icontext.DNSTypeRaw)
 		return upstream, nil
 	})

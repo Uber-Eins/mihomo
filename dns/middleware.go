@@ -1,6 +1,7 @@
 package dns
 
 import (
+	"context"
 	"math"
 	"net"
 	"net/netip"
@@ -149,7 +150,7 @@ func withMapping(mapping *lru.LruCache[netip.Addr, string]) middleware {
 	}
 }
 
-func withFakeIP(skipper *fakeip.Skipper, fakePool *fakeip.Pool, fakePool6 *fakeip.Pool, fakeIPTTL int) middleware {
+func withFakeIP(skipper *fakeip.Skipper, fakePool *fakeip.Pool, fakePool6 *fakeip.Pool, fakeIPTTL int, httpsWait time.Duration) middleware {
 	return func(next handler) handler {
 		return func(ctx *icontext.DNSContext, r *D.Msg) (*D.Msg, error) {
 			q := r.Question[0]
@@ -216,6 +217,10 @@ func withFakeIP(skipper *fakeip.Skipper, fakePool *fakeip.Pool, fakePool6 *fakei
 				return next(ctx, r)
 			}
 
+			if httpsWait > 0 {
+				waitFakeIPHTTPS(ctx, next, q.Name, httpsWait)
+			}
+
 			msg := r.Copy()
 			msg.Answer = []D.RR{rr}
 
@@ -227,6 +232,30 @@ func withFakeIP(skipper *fakeip.Skipper, fakePool *fakeip.Pool, fakePool6 *fakei
 
 			return msg, nil
 		}
+	}
+}
+
+// waitFakeIPHTTPS starts the upstream HTTPS lookup for name and waits for it,
+// at most wait, before a fake A/AAAA answer is returned. Clients like Chromium
+// wait only briefly for HTTPS once A/AAAA arrive, which leaves no room after
+// an instant fake answer. The lookup keeps running past the wait so its result
+// still reaches the cache, and the client's own HTTPS query joins it in the
+// resolver instead of querying upstream again.
+func waitFakeIPHTTPS(ctx context.Context, next handler, name string, wait time.Duration) {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		lookupCtx, cancel := context.WithTimeout(context.Background(), resolver.DefaultDNSTimeout)
+		defer cancel()
+		_, _ = next(icontext.NewDNSContext(lookupCtx), new(D.Msg).SetQuestion(name, D.TypeHTTPS))
+	}()
+
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-done:
+	case <-timer.C:
+	case <-ctx.Done():
 	}
 }
 
@@ -372,7 +401,7 @@ func newHandler(resolver resolver.Resolver, mapper *ResolverEnhancer) handler {
 	}
 
 	if mapper.mode == C.DNSFakeIP {
-		middlewares = append(middlewares, withFakeIP(mapper.fakeIPSkipper, mapper.fakeIPPool, mapper.fakeIPPool6, mapper.fakeIPTTL))
+		middlewares = append(middlewares, withFakeIP(mapper.fakeIPSkipper, mapper.fakeIPPool, mapper.fakeIPPool6, mapper.fakeIPTTL, mapper.fakeIPHTTPSWait))
 	}
 
 	if mapper.mode != C.DNSNormal {
