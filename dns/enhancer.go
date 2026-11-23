@@ -11,15 +11,16 @@ import (
 )
 
 type ResolverEnhancer struct {
-	ipv6            bool
-	mode            C.DNSMode
-	fakeIPPool      *fakeip.Pool
-	fakeIPPool6     *fakeip.Pool
-	fakeIPSkipper   *fakeip.Skipper
-	fakeIPTTL       int
-	fakeIPHTTPSWait time.Duration
-	mapping         *lru.LruCache[netip.Addr, string]
-	useHosts        bool
+	ipv6                 bool
+	mode                 C.DNSMode
+	fakeIPPool           *fakeip.Pool
+	fakeIPPool6          *fakeip.Pool
+	fakeIPSkipper        *fakeip.Skipper
+	fakeIPTTL            int
+	fakeIPDisableMapping bool
+	mapping              *lru.LruCache[netip.Addr, string]
+	useHosts             bool
+	fakeIPHTTPSWait      time.Duration
 }
 
 func (h *ResolverEnhancer) FakeIPEnabled() bool {
@@ -161,14 +162,15 @@ func (h *ResolverEnhancer) StoreFakePoolState() {
 }
 
 type EnhancerConfig struct {
-	IPv6            bool
-	EnhancedMode    C.DNSMode
-	FakeIPPool      *fakeip.Pool
-	FakeIPPool6     *fakeip.Pool
-	FakeIPSkipper   *fakeip.Skipper
-	FakeIPTTL       int
-	FakeIPHTTPSWait time.Duration
-	UseHosts        bool
+	IPv6                 bool
+	EnhancedMode         C.DNSMode
+	FakeIPPool           *fakeip.Pool
+	FakeIPPool6          *fakeip.Pool
+	FakeIPSkipper        *fakeip.Skipper
+	FakeIPTTL            int
+	FakeIPDisableMapping bool
+	UseHosts             bool
+	FakeIPHTTPSWait      time.Duration
 }
 
 func NewEnhancer(cfg EnhancerConfig) *ResolverEnhancer {
@@ -185,6 +187,7 @@ func NewEnhancer(cfg EnhancerConfig) *ResolverEnhancer {
 		}
 		e.fakeIPSkipper = cfg.FakeIPSkipper
 		e.fakeIPTTL = cfg.FakeIPTTL
+		e.fakeIPDisableMapping = cfg.FakeIPDisableMapping
 		if e.fakeIPTTL < 1 {
 			e.fakeIPTTL = 1
 		}
